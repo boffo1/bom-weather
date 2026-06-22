@@ -4,7 +4,7 @@
 set -e
 
 # Keep all project files together under ~/bin/bom/bom-weather-py
-PROJECT_DIR="$HOME/bin/bom/bom-weather-py"
+PROJECT_DIR="$HOME/bin/bom/py-bom-weather"
 CACHE_DIR="$PROJECT_DIR"
 PRODUCT="IDV60920"
 

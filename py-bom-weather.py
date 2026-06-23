@@ -4,7 +4,7 @@
 Parse BOM XML (IDV60920.xml), keep a rolling history of MSL pressure
 values per WMO station, and render a text view grouped by config.
 
-All project files are kept under ~/bin/bom/bom-weather-py by default.
+All project files are kept under ~/bin/bom/py-bom-weather by default.
 """
 from __future__ import annotations
 
@@ -155,7 +155,7 @@ def load_xml(path: Path) -> Dict[str, List[Station]]:
 
     for stn in root.findall(".//station"):
         wmo = stn.get("wmo-id")
-        name = stn.get("stn-name") or "UNKNOWN"
+        name = stn.get("description") or "UNKNOWN" # get the station commonn name @description
         district = stn.get("forecast-district-id")
 
         # find MSL pressure under the surface level

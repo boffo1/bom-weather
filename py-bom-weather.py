@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 import re
+import subprocess
 import xml.etree.ElementTree as ET
 from collections import deque, OrderedDict
 from dataclasses import dataclass
@@ -22,10 +23,20 @@ PROJECT_DIR = Path.home() / "bin" / "bom" / "py-bom-weather"
 CACHE_DIR = PROJECT_DIR
 CONFIG_PATH = PROJECT_DIR / "bom_weather.config"
 
-XML_PATH = PROJECT_DIR / "IDV60920.xml"
 OUT_PATH = PROJECT_DIR / "pressure_history.txt"
 
 DEFAULT_HISTORY_SIZE = 10
+
+# State to XML prefix mapping (matching bash script)
+STATE_PREFIX = {
+    "VIC": "V",
+    "NSW": "N",
+    "QLD": "Q",
+    "SA": "S",
+    "WA": "W",
+    "TAS": "T",
+    "NT": "D",
+}
 
 log = logging.getLogger(__name__)
 
@@ -35,11 +46,13 @@ class Station:
     wmo: str
     name: str
     mslp: str
+    district_id: str  # Add district tracking
 
 
 @dataclass
 class HistoryEntry:
     name: str
+    district_id: str
     values: Deque[str]
 
 
@@ -88,6 +101,41 @@ def load_config(path: Path) -> "OrderedDict[str, List[Tuple[str, str]]]":
 
 
 # ----------------------------
+# FETCH XML
+# ----------------------------
+def fetch_xml(state: str, xml_path: Path) -> None:
+    """
+    Download XML from BoM FTP server using curl.
+    Only downloads if remote file is newer than local file.
+    Shows progress bar using curl -# flag.
+    """
+    if state not in STATE_PREFIX:
+        raise ValueError(f"Unsupported state: {state}")
+
+    prefix = STATE_PREFIX[state]
+    filename = f"ID{prefix}60920.xml"
+    ftp_url = f"ftp://ftp.bom.gov.au/anon/gen/fwo/{filename}"
+    
+    xml_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    log.info(f"Checking for updates from BoM ({state})...")
+    
+    # Use curl with -z flag to conditionally download only if remote is newer
+    # -# shows a simple progress bar
+    # -f fails on HTTP errors
+    cmd = ["curl", "-#", "-f", "-z", str(xml_path), ftp_url, "-o", str(xml_path)]
+    
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        log.info(f"Downloaded/updated {filename}")
+        if result.stdout:
+            log.debug(result.stdout)
+    except subprocess.CalledProcessError as e:
+        log.error(f"Failed to fetch XML from {ftp_url}: {e.stderr}")
+        raise
+
+
+# ----------------------------
 # XML PARSE (FIXED GROUPING)
 # ----------------------------
 def load_xml(path: Path) -> Dict[str, List[Station]]:
@@ -107,7 +155,7 @@ def load_xml(path: Path) -> Dict[str, List[Station]]:
 
     for stn in root.findall(".//station"):
         wmo = stn.get("wmo-id")
-        name = stn.get("stn-name") or "UNKNOWN"
+        name = stn.get("description") or "UNKNOWN" # get the station commonn name @description
         district = stn.get("forecast-district-id")
 
         # find MSL pressure under the surface level
@@ -119,7 +167,7 @@ def load_xml(path: Path) -> Dict[str, List[Station]]:
             continue
 
         stations_by_district.setdefault(district, []).append(
-            Station(wmo, name, mslp_val)
+            Station(wmo, name, mslp_val, district)
         )
 
     return stations_by_district
@@ -133,7 +181,7 @@ def load_history(path: Path, history_size: int = DEFAULT_HISTORY_SIZE) -> Dict[s
     Load existing history file into memory.
 
     Format per-line:
-      WMO|Station Name|val1,val2,val3
+      WMO|Station Name|District ID|val1,val2,val3
 
     Lines starting with '#' or without '|' are ignored.
     """
@@ -148,12 +196,12 @@ def load_history(path: Path, history_size: int = DEFAULT_HISTORY_SIZE) -> Dict[s
             if not line or line.startswith("#") or "|" not in line:
                 continue
 
-            parts = [p.strip() for p in line.split("|", 2)]
-            if len(parts) < 3:
+            parts = [p.strip() for p in line.split("|", 3)]
+            if len(parts) < 4:
                 continue
-            wmo, name, values = parts
+            wmo, name, district_id, values = parts
             dq = deque((v for v in (values.split(",") if values else []) if v), maxlen=history_size)
-            history[wmo] = HistoryEntry(name=name, values=dq)
+            history[wmo] = HistoryEntry(name=name, district_id=district_id, values=dq)
 
     return history
 
@@ -171,12 +219,14 @@ def update_history(history: Dict[str, HistoryEntry], stations_by_district: Mappi
             wmo = s.wmo
             name = s.name
             value = s.mslp
+            district_id = s.district_id
 
             if wmo not in history:
-                history[wmo] = HistoryEntry(name=name, values=deque(maxlen=history_size))
+                history[wmo] = HistoryEntry(name=name, district_id=district_id, values=deque(maxlen=history_size))
 
-            # always update stored name (in case it changed)
+            # always update stored name and district (in case it changed)
             history[wmo].name = name
+            history[wmo].district_id = district_id
             history[wmo].values.append(value)
 
     return history
@@ -187,14 +237,15 @@ def update_history(history: Dict[str, HistoryEntry], stations_by_district: Mappi
 # ----------------------------
 def save_history(path: Path, history: Mapping[str, HistoryEntry]) -> None:
     """
-    Persist the history mapping to `path`. Each line is: WMO|Name|val1,val2,...
+    Persist the history mapping to `path`. Each line is: WMO|Name|District ID|val1,val2,...
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     lines: List[str] = []
     for wmo, entry in history.items():
         values = ",".join(entry.values)
-        lines.append(f"{wmo}|{entry.name}|{values}")
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        lines.append(f"{wmo}|{entry.name}|{entry.district_id}|{values}")
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ----------------------------
@@ -202,7 +253,7 @@ def save_history(path: Path, history: Mapping[str, HistoryEntry]) -> None:
 # ----------------------------
 def render(config: Mapping[str, Iterable[Tuple[str, str]]], history: Mapping[str, HistoryEntry], stations_by_district: Mapping[str, Iterable[Station]]) -> str:
     """
-    Render the textual view grouping stations by the config order.
+    Render the textual view grouping stations by state, then district.
     """
     out_lines: List[str] = []
     for state, districts in config.items():
@@ -227,22 +278,40 @@ def render(config: Mapping[str, Iterable[Tuple[str, str]]], history: Mapping[str
 # ----------------------------
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Maintain MSLP history from BOM XML and render per-config view.")
-    parser.add_argument("--xml", type=Path, default=XML_PATH, help="Path to the BOM XML file")
+    parser.add_argument("--state", type=str, choices=list(STATE_PREFIX.keys()), default="VIC", 
+                        help="Australian state (default: VIC)")
+    parser.add_argument("--xml", type=Path, help="Path to the BOM XML file (auto-generated if not specified)")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="Path to the config file")
     parser.add_argument("--out", type=Path, default=OUT_PATH, help="Path to the history output file")
     parser.add_argument("--history-size", type=int, default=DEFAULT_HISTORY_SIZE, help="Number of history values to keep per station")
+    parser.add_argument("--no-download", action="store_true", help="Skip downloading remote XML")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(levelname)s: %(message)s")
 
-    if not args.xml.exists():
-        log.error("Missing XML file at %s. Run py_fetch_xml.sh first.", args.xml)
-        return 2
-
     # ensure cache dir exists
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Generate XML path based on state if not specified
+    if args.xml is None:
+        prefix = STATE_PREFIX[args.state]
+        xml_filename = f"ID{prefix}60920.xml"
+        args.xml = CACHE_DIR / xml_filename
+
+    # Fetch XML (unless --no-download)
+    if not args.no_download:
+        try:
+            fetch_xml(args.state, args.xml)
+        except Exception as e:
+            log.error(f"Error fetching XML: {e}")
+            if not args.xml.exists():
+                return 2
+
+    if not args.xml.exists():
+        log.error("Missing XML file at %s. Run with --state to download.", args.xml)
+        return 2
 
     config = load_config(args.config)
     stations_by_district = load_xml(args.xml)

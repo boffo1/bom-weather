@@ -126,12 +126,15 @@ def fetch_xml(state: str, xml_path: Path) -> None:
     cmd = ["curl", "-#", "-f", "-z", str(xml_path), ftp_url, "-o", str(xml_path)]
     
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        # don't capture output so the curl progress bar is visible to the user
+        subprocess.run(cmd, check=True)
         log.info(f"Downloaded/updated {filename}")
-        if result.stdout:
-            log.debug(result.stdout)
+    except FileNotFoundError:
+        log.error("curl not found; install curl or run with --no-download and provide --xml")
+        raise
     except subprocess.CalledProcessError as e:
-        log.error(f"Failed to fetch XML from {ftp_url}: {e.stderr}")
+        # when not capturing output, stderr may not be available on the exception
+        log.error(f"Failed to fetch XML from {ftp_url}: {e}")
         raise
 
 
@@ -155,7 +158,7 @@ def load_xml(path: Path) -> Dict[str, List[Station]]:
 
     for stn in root.findall(".//station"):
         wmo = stn.get("wmo-id")
-        name = stn.get("description") or "UNKNOWN" # get the station commonn name @description
+        name = stn.get("description") or "UNKNOWN" # get the station common name @description
         district = stn.get("forecast-district-id")
 
         # find MSL pressure under the surface level
